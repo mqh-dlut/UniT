@@ -1,4 +1,4 @@
-name: unitenv
+name: unitenv_no_t3
 channels:
   - pytorch
   - pytorch3d
@@ -25,6 +25,7 @@ dependencies:
   - einops=0.4.1
   - tqdm=4.64.1
   - dill=0.3.5.1
+  - multiprocess=0.70.13 # 额外指明安装, 好像也需指明安装- pyarrow=14.0.2
   - scikit-video=1.1.11
   - scikit-image=0.19.3
   - gym=0.21.0
@@ -58,7 +59,11 @@ dependencies:
     - pytorchvideo==0.1.5
     - imagecodecs==2022.9.26
     - r3m @ https://github.com/facebookresearch/r3m/archive/b2334e726887fa0206962d7984c69c5fb09cceab.tar.gz
+    
+    # 固定 MuJoCo，避免 pip 在 2026 年选择新版并尝试源码编译
+    - mujoco==2.3.7
     - dm-control==1.0.9
+
     - byol-pytorch
     - pytorch-lightning==1.0.8
     - rerun-sdk
