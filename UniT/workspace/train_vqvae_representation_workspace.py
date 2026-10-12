@@ -1,3 +1,6 @@
+# 表征预训练代码
+#! 这里注意模型的选取以及设置了ckpt接续训练
+
 if __name__ == "__main__":
     import sys
     import os
@@ -34,7 +37,7 @@ import wandb
 import copy
 from UniT.dataset.tactile_representation_dataset import TactileRepresentationDataset
 from UniT.dataset.tactile_representation_dataset_ycb import TactileRepresentationDatasetYcb
-from UniT.taming.models.vqgan import VQModel, WOVQModel
+from UniT.taming.models.vqgan import VQModel, WOVQModel, TemporalVQModel
 from UniT.dataset.representation_wrapper import RepresentationWrapper
 from UniT.taming.logging_util import *
 
@@ -52,12 +55,26 @@ class TrainVqvaeRepresentationWorkspace(BaseWorkspace):
         random.seed(seed)
         trainer_config = {}
         trainer_config["gpus"] = cfg.gpus
+        trainer_config["strategy"] = "ddp"
+        trainer_config["max_epochs"] = cfg.max_epochs
+        trainer_config["accumulate_grad_batches"] = cfg.accumulate_grad_batches
+
         # configure model
         model = None
         if cfg.with_vq:
-            model = VQModel(**cfg.model)
-            name = 'vq'
-            print('vq model')
+            if cfg.get("use_temporal_transformer", False) and cfg.baseline_ckpt:
+                model = TemporalVQModel(**cfg.model)
+                model.init_from_ckpt(cfg.baseline_ckpt)
+                name = 'temporal_vq'
+                print('temporal_vq model')
+            elif cfg.get("use_temporal_transformer", False) and not cfg.baseline_ckpt:
+                model = TemporalVQModel(**cfg.model)
+                name = 'temporal_vq_fromhead'
+                print('temporal_vq_fromhead')
+            else:
+                model = VQModel(**cfg.model)
+                name = 'vq'
+                print('vq model')
         else:
             model = WOVQModel(**cfg.model)
             name = 'wovq'
@@ -106,6 +123,89 @@ class TrainVqvaeRepresentationWorkspace(BaseWorkspace):
         self.lightning_config = lightning_config
         self.cpktdir = ckptdir
         self.opt = opt
+
+    # ==================================================
+    # 可视化重建图
+    # ==================================================
+    def visualize_reconstruction(self, data, ckpt_path, num_show=6):
+        import matplotlib.pyplot as plt
+        print("\n========== Reconstruction Visualization ==========")
+        print("Loading checkpoint:")
+        print(ckpt_path)
+
+        checkpoint = torch.load(ckpt_path, map_location="cpu")
+        if "state_dict" in checkpoint:
+            state_dict = checkpoint["state_dict"]
+        else:
+            state_dict = checkpoint
+        self.model.load_state_dict(state_dict)
+        print("Checkpoint loaded successfully.")
+
+        # 只用一张 GPU 做推理
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.model = self.model.to(device)
+        self.model.eval()
+
+        # 直接取训练时使用的 dataloader
+        train_loader = data.train_dataloader()
+        batch = next(iter(train_loader))
+        # 只 forward，不训练
+        with torch.no_grad():
+            log = self.model.log_images(batch)
+
+        x_real = log["inputs"].detach().cpu()
+        x_rec = log["reconstructions"].detach().cpu()
+        
+        print("\nShape:")
+        print("Real           :", x_real.shape)
+        print("Reconstruction :", x_rec.shape)
+
+        print("\nValue range:")
+        print(
+            "Real: min={:.6f}, max={:.6f}, mean={:.6f}".format(
+                x_real.min().item(),
+                x_real.max().item(),
+                x_real.mean().item()
+            )
+        )
+        print(
+            "Rec : min={:.6f}, max={:.6f}, mean={:.6f}".format(
+                x_rec.min().item(),
+                x_rec.max().item(),
+                x_rec.mean().item()
+            )
+        )
+
+        # 真实图本来就是 [0,1], dataset 中明确写了: astype(np.float32) / 255.
+        real_vis = x_real.clamp(0, 1)
+        # reconstruction 是网络输出, 为了显示先限制在合法 RGB 范围
+        rec_vis = x_rec.clamp(0, 1)
+
+        num_show = min(num_show, x_real.shape[0])
+        fig, axes = plt.subplots(num_show, 2, figsize=(8, num_show * 3))
+        if num_show == 1:
+            axes = axes.reshape(1, 2)
+        for i in range(num_show):
+            real_img = real_vis[i].permute(1, 2, 0).numpy()
+            rec_img = rec_vis[i].permute(1, 2, 0).numpy()
+
+            axes[i, 0].imshow(real_img)
+            axes[i, 0].set_title(f"Sample {i} - Real x_t")
+            axes[i, 0].axis("off")
+
+            axes[i, 1].imshow(rec_img)
+            axes[i, 1].set_title(f"Sample {i} - Reconstruction")
+            axes[i, 1].axis("off")
+        plt.tight_layout()
+
+        save_path = "real_vs_reconstruction_epoch29.png"
+
+        plt.savefig(save_path, dpi=200, bbox_inches="tight")
+        print("\nSaved visualization to:")
+        print(save_path)
+        plt.close()
+    # ==================================================
+
     def run(self):
         cfg = copy.deepcopy(self.cfg)
         lightning_config = self.lightning_config
@@ -115,6 +215,18 @@ class TrainVqvaeRepresentationWorkspace(BaseWorkspace):
         else:
             human_demonstrations_img = TactileRepresentationDataset(**cfg.dataset)
         data = RepresentationWrapper(human_demonstrations_img,cfg)
+
+        # =================================
+        # 临时增加, 以后要注释掉
+        # =================================
+        # self.visualize_reconstruction(
+        #     data=data, 
+        #     ckpt_path="/mnt/nvme0n1/home/mmm/projects/UniT/representation_models/2026-09-18T09-33-05temporal_vq/checkpoints/checkpoint-epoch=29.ckpt",
+        #     num_show=6
+        # )
+        # return
+        # ==================================
+
         bs, base_lr = cfg.batch_size, cfg.base_learning_rate
         ngpu = len(lightning_config.trainer.gpus.strip(",").split(','))
         accumulate_grad_batches = lightning_config.trainer.get('accumulate_grad_batches', 1)
@@ -124,12 +236,17 @@ class TrainVqvaeRepresentationWorkspace(BaseWorkspace):
 
         if opt.train:
             try:
-                self.trainer.fit(self.model, data)
-
+                self.trainer.fit(self.model, data) # 每一轮都会进行训练和验证, 但没传参, 并不进行验证
+                # resume_ckpt = "/mnt/nvme0n1/home/mmm/projects/UniT/representation_models/2026-09-18T09-33-05temporal_vq/checkpoints/checkpoint-epoch=29.ckpt"
+                # self.trainer.fit(
+                #     self.model,
+                #     data,
+                #     ckpt_path=resume_ckpt
+                # )
             except Exception:
                 raise
         if not opt.no_test and not self.trainer.interrupted:
-            self.trainer.test(self.model, data)
+            self.trainer.test(self.model, data) # 测试
 
 @hydra.main(
     version_base=None,
