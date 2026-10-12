@@ -1,3 +1,5 @@
+# Allen Key数据训练UniT原Encoder
+
 _target_: UniT.workspace.train_vqvae_representation_workspace.TrainVqvaeRepresentationWorkspace
 base_learning_rate: 4.5e-6
 
@@ -7,6 +9,10 @@ shape_meta: &shape_meta
       shape: [3, 240, 320]
       type: rgb
 with_vq: true
+use_temporal_transformer: false # 用transformer微调就是true, 不是就是false
+# baseline_ckpt: "/mnt/storage/mmm/recur_UniT/2024-08-01T15-09-47vq/checkpoints/checkpoint-epoch=342.ckpt"
+baseline_ckpt: null
+datatype: key
 model:
   embed_dim: 3
   n_embed: 1024
@@ -37,11 +43,11 @@ dataset:
         shape: [3, 240, 320]
         type: rgb
 
-  dataset_path: data/allen_key_gelsight
-  horizon: 1
+  dataset_path: /mnt/storage/mmm/recur_UniT/allen_key_gelsight # data/allen_key_gelsight
+  horizon: 1 # 一条训练数据包括多少个连续时间步 1 4
   max_train_episodes: null
-  pad_after: 1
-  pad_before: 1
+  pad_after: 1 # 前面补几帧 1 0
+  pad_before: 1 # 后面补几帧 1 0
   seed: 42
   val_ratio: 0
 val_dataloader:
@@ -51,13 +57,14 @@ val_dataloader:
   pin_memory: true
   shuffle: false
 dataloader:
-  batch_size: 32
+  batch_size: 16 # 32
   num_workers: 8
   persistent_workers: false
   pin_memory: true
   shuffle: true
-gpus: '0,'
-batch_size: 32
+gpus: '0,1'
+batch_size: 16 # 32
+accumulate_grad_batches: 1 # 后填的, 一帧填1就够了, 因为batch为16就可以跑
 seed: 42
 trainer:
   name: "vq_representiaon_dubug"
@@ -70,4 +77,4 @@ trainer:
   postfix: ""
   train: true
 save_every: 1
-max_epochs: 100000
+max_epochs: 344
