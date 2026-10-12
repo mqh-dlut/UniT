@@ -1,3 +1,5 @@
+# 原始模型VQModel以及重写了添加了Transformer模块的VQModel
+
 import torch
 import torch.nn.functional as F
 import pytorch_lightning as pl
@@ -28,10 +30,10 @@ class VQModel(pl.LightningModule):
         self.decoder = Decoder(**ddconfig)
         self.loss = instantiate_from_config(lossconfig)
         self.quantize = VectorQuantizer(n_embed, embed_dim, beta=0.25,
-                                        remap=remap, sane_index_shape=sane_index_shape)
-        self.quant_conv = torch.nn.Conv2d(ddconfig["z_channels"], embed_dim, 1)
+                                        remap=remap, sane_index_shape=sane_index_shape) # 量化层 1024*3的码本
+        self.quant_conv = torch.nn.Conv2d(ddconfig["z_channels"], embed_dim, 1) # 1*1卷积
 
-        self.post_quant_conv = torch.nn.Conv2d(embed_dim, ddconfig["z_channels"], 1)
+        self.post_quant_conv = torch.nn.Conv2d(embed_dim, ddconfig["z_channels"], 1) # quant_conv相反
         if ckpt_path is not None:
             print('init from ckpt')
             self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys)
@@ -50,8 +52,16 @@ class VQModel(pl.LightningModule):
                 if k.startswith(ik):
                     print("Deleting key {} from state_dict.".format(k))
                     del sd[k]
-        self.load_state_dict(sd, strict=False)
+
+        missing_keys, unexpected_keys = self.load_state_dict(sd, strict=False) # 监测是否真的读取到了
         print(f"Restored from {path}")
+        # print("\nMissing keys:")
+        # for k in missing_keys:
+        #     print("  ", k)
+        # print("\nUnexpected keys:")
+        # for k in unexpected_keys:
+        #     print("  ", k)
+        
 
     def encode(self, x):
         h = self.encoder(x)
@@ -59,7 +69,7 @@ class VQModel(pl.LightningModule):
         quant, emb_loss, info = self.quantize(h)
         return quant, emb_loss, info
     
-    def to_latent(self, x):
+    def to_latent(self, x): # 下游任务的时候用这种representation
         h1 = self.encoder(x)
         h2 = self.quant_conv(h1)
         return  h2
@@ -88,9 +98,9 @@ class VQModel(pl.LightningModule):
         x = x.permute(0, 3, 1, 2).to(memory_format=torch.contiguous_format)
         return x.float()
 
-    def training_step(self, batch, batch_idx, optimizer_idx):
+    def training_step(self, batch, batch_idx, optimizer_idx): # 总调用控制器
         x = self.get_input(batch, self.image_key)
-        xrec, qloss = self(x)
+        xrec, qloss = self(x) # 等价于self.forward(x)
 
         if optimizer_idx == 0:
             # autoencode
@@ -126,7 +136,7 @@ class VQModel(pl.LightningModule):
         self.log_dict(log_dict_disc)
         return self.log_dict
 
-    def configure_optimizers(self):
+    def configure_optimizers(self): # 负责告诉Lightning哪些参数要被训练
         lr = self.learning_rate
         opt_ae = torch.optim.Adam(list(self.encoder.parameters())+
                                   list(self.decoder.parameters())+
@@ -163,6 +173,264 @@ class VQModel(pl.LightningModule):
         x = 2.*(x-x.min())/(x.max()-x.min()) - 1.
         return x
 
+class TemporalTransformerFusion(torch.nn.Module):
+    def __init__(
+        self,
+        in_dim=3,
+        d_model=64,
+        nhead=4,
+        num_layers=2,
+        max_seq_len=16,
+        dropout=0.0
+    ):
+        super().__init__()
+        self.input_proj = torch.nn.Linear(in_dim, d_model) # 将三维扩展至64维
+
+        # 时间位置编码
+        self.temporal_pos_embed = torch.nn.Parameter(torch.zeros(1, max_seq_len, d_model))
+        # Transformer
+        encoder_layer = torch.nn.TransformerEncoderLayer(
+            d_model=d_model, # token维度
+            nhead=nhead, # 注意力头数, 一般是d_model/4, d_model mod nhead一定为0
+            dim_feedforward=d_model * 4, # FFN的隐藏维度(attention后的FFN)
+            dropout=dropout,
+            activation="gelu", # 激活函数
+            batch_first=True # 这个参数规定Transformer输入格式是[B, Sequence, Feature]
+        )
+        self.transformer = torch.nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers
+        )
+
+        self.output_proj = torch.nn.Linear(d_model, in_dim) # 64维变回3维通道
+
+        # 初始时让 Temporal 分支输出接近0, 这样模型一开始近似原始UniT
+        torch.nn.init.zeros_(self.output_proj.weight)
+        torch.nn.init.zeros_(self.output_proj.bias)
+
+    def forward(self, h_seq):
+        B, T, C, H, W = h_seq.shape
+        if T > self.temporal_pos_embed.shape[1]:
+            raise ValueError(f"T={T} exceeds max_seq_len={self.temporal_pos_embed.shape[1]}")
+
+        x = h_seq.permute(0, 3, 4, 1, 2).contiguous() # ->[B,H,W,T,C]
+        x = x.view(B * H * W, T, C) # ->[B*H*W,T,C] 共有B*H*W个序列, 每个序列有T个时间步, 每个序列三维
+        x = self.input_proj(x) # [B*H*W,T,64]
+
+        # 加时间位置编码
+        x = x + self.temporal_pos_embed[:, :T]
+
+        # Temporal Transformer
+        x = self.transformer(x) # [B*H*W,T,64]
+        x = x[:, -1, :] # 只取最后一个时间位置 [B*H*W,64]
+
+        delta = self.output_proj(x)
+        delta = delta.view(B, H, W, C)
+        delta = delta.permute(0, 3, 1, 2).contiguous()
+
+        # Residual残差分支 不需要从头生成帧，只需要根据过去的三帧来学会修正多少
+        current_feature = h_seq[:, -1]
+        fused_feature = current_feature + delta
+
+        return fused_feature
+
+class TemporalVQModel(VQModel):
+    def __init__(
+        self,
+        ddconfig,
+        lossconfig,
+        n_embed,
+        embed_dim,
+        temporal_dim=64,
+        temporal_heads=4,
+        temporal_layers=2,
+        temporal_max_len=16,
+        **kwargs
+    ):
+        super().__init__(
+            ddconfig=ddconfig,
+            lossconfig=lossconfig,
+            n_embed=n_embed,
+            embed_dim=embed_dim,
+            **kwargs
+        )
+
+        self.temporal_fusion = TemporalTransformerFusion(
+            in_dim=ddconfig["z_channels"],
+            d_model=temporal_dim,
+            nhead=temporal_heads,
+            num_layers=temporal_layers,
+            max_seq_len=temporal_max_len,
+            dropout=0.0
+        )
+
+    def get_input(self, batch, k):
+        x = batch[k]
+        if len(x.shape) == 3:
+            x = x[..., None]
+
+        # Temporal dataset:[B, T, H, W, C]
+        if x.ndim == 5:
+            x = x.permute(0, 1, 4, 2, 3).contiguous() # ->[B, T, C, H, W]
+        # 兼容原来的单帧输入
+        elif x.ndim == 4:
+            x = x.permute(0, 3, 1, 2).contiguous() # ->[B, C, H, W]
+        else:
+            raise ValueError(f"Unexpected input shape: {x.shape}")
+
+        return x.float()
+
+    def encode(self, x):
+        # 如果是普通单帧，保持原逻辑
+        if x.ndim == 4:
+            h = self.encoder(x)
+            h = self.quant_conv(h)
+            quant, emb_loss, info = self.quantize(h)
+            return quant, emb_loss, info
+
+        # Temporal input
+        # [B, T, C, H, W]
+        if x.ndim == 5:
+            B, T, C, H, W = x.shape
+            # 把 batch 和时间维合并, 方便输入Encoder中
+            x_flat = x.reshape(B * T, C, H, W)
+            h_flat = self.encoder(x_flat) # 预计:[B*T, 3, 16, 20]
+            _, C_z, H_z, W_z = h_flat.shape
+
+            # 恢复时间维
+            h_seq = h_flat.reshape(B, T, C_z, H_z, W_z)
+
+            #todo: 加入transformer
+            # 只取每个batch最后一帧加入到transformer中, transformer会输出四帧的信息, 最后一帧已经融入了前三帧的信息
+            h = self.temporal_fusion(h_seq)
+
+            h = self.quant_conv(h)
+            quant, emb_loss, info = self.quantize(h)
+
+            return quant, emb_loss, info
+
+        raise ValueError(
+            f"Unexpected input shape: {x.shape}"
+        )
+
+    def to_latent(self, x):
+        # 单帧输入：保持原始 UniT 的 downstream 行为
+        if x.ndim == 4:
+            h = self.encoder(x)
+            h = self.quant_conv(h)
+            return h
+
+        # Temporal 输入：[B,T,C,H,W]
+        if x.ndim == 5:
+            B, T, C, H, W = x.shape
+            x_flat = x.reshape(B * T, C, H, W)
+            h_flat = self.encoder(x_flat)
+
+            _, C_z, H_z, W_z = h_flat.shape
+            h_seq = h_flat.reshape(B, T, C_z, H_z, W_z)
+
+            h = self.temporal_fusion(h_seq)
+            h = self.quant_conv(h)
+            return h
+
+        raise ValueError(f"Unexpected input shape: {x.shape}")
+
+    def training_step(self, batch, batch_idx, optimizer_idx):
+        x_seq = self.get_input(batch, self.image_key) # [B,T,C,H,W]
+        x_target = x_seq[:, -1] # reconstruction target是最后一帧
+        xrec, qloss = self(x_seq) # [B,C,H,W]
+
+        if optimizer_idx == 0:
+            aeloss, log_dict_ae = self.loss(qloss, x_target, xrec, optimizer_idx, self.global_step,
+                                            last_layer=self.get_last_layer(), split="train")
+            self.log("train/aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
+            self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=True, sync_dist=True)
+            return aeloss
+
+        if optimizer_idx == 1:
+            # discriminator
+            discloss, log_dict_disc = self.loss(qloss, x_target, xrec, optimizer_idx, self.global_step,
+                                            last_layer=self.get_last_layer(), split="train")
+            self.log("train/discloss", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
+            self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=True, sync_dist=True)
+            return discloss
+
+    def validation_step(self, batch, batch_idx):
+        x_seq = self.get_input(batch, self.image_key)
+        x_target = x_seq[:, -1]
+        xrec, qloss = self(x_seq)
+
+        aeloss, log_dict_ae = self.loss(qloss, x_target, xrec, 0, self.global_step,
+                                        last_layer=self.get_last_layer(), split="val")
+
+        discloss, log_dict_disc = self.loss(qloss, x_target, xrec, 1, self.global_step,
+                                            last_layer=self.get_last_layer(), split="val")
+        rec_loss = log_dict_ae["val/rec_loss"]
+        self.log("val/rec_loss", rec_loss,
+                    prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("val/aeloss", aeloss,
+                    prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log_dict(log_dict_ae)
+        self.log_dict(log_dict_disc)
+
+        return self.log_dict
+
+    # def on_after_backward(self):
+    #     if self.global_step < 5:
+    #         print("\n====== Temporal gradients ======")
+    #         for name, p in self.temporal_fusion.named_parameters():
+    #             if p.grad is None:
+    #                 print(name, "grad = None")
+    #             else:
+    #                 print(name, "grad mean =", p.grad.abs().mean().item())
+
+    def configure_optimizers(self):
+        lr = self.learning_rate
+        opt_ae = torch.optim.Adam(
+            [
+                 {
+                    "params": self.temporal_fusion.parameters(),
+                    "lr": lr
+                 },
+                 {
+                    "params":
+                        list(self.encoder.parameters()) +
+                        list(self.decoder.parameters()) +
+                        list(self.quantize.parameters()) +
+                        list(self.quant_conv.parameters()) +
+                        list(self.post_quant_conv.parameters()),
+                    "lr": lr, # lr * 0.1
+                 }
+            ],
+            betas=(0.5, 0.9)
+        )
+
+        opt_disc = torch.optim.Adam(
+            self.loss.discriminator.parameters(),
+            lr=lr, # lr * 0.1,
+            betas=(0.5, 0.9)
+        )
+
+        return [opt_ae, opt_disc], []
+
+    def log_images(self, batch, **kwargs):
+        log = dict()
+        x_seq = self.get_input(batch, self.image_key)
+        x_seq = x_seq.to(self.device)
+        # 只显示最后一帧 ground truth
+        x_target = x_seq[:, -1]
+        xrec, _ = self(x_seq)
+
+        if x_target.shape[1] > 3:
+            assert xrec.shape[1] > 3
+            x_target = self.to_rgb(x_target)
+            xrec = self.to_rgb(xrec)
+
+        log["inputs"] = x_target
+        log["reconstructions"] = xrec
+
+        return log
+        
 
 class VQSegmentationModel(VQModel):
     def __init__(self, n_labels, *args, **kwargs):
