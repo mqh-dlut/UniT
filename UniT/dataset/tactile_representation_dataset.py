@@ -1,3 +1,6 @@
+# 预训练数据集处理
+#! 注意horizon、no_obs_steps的切换、一帧和四帧写法的切换
+
 from typing import Dict
 import torch
 import numpy as np
@@ -21,7 +24,7 @@ class TactileRepresentationDataset(BaseImageDataset):
     def __init__(self,
             shape_meta: dict,
             dataset_path: str,
-            horizon=1,
+            horizon=4, # 1 4
             pad_before=0,
             pad_after=0,
             n_obs_steps=None,
@@ -86,6 +89,8 @@ class TactileRepresentationDataset(BaseImageDataset):
         # Dummy value
         self.horizon = 1
         self.n_obs_steps = 1
+        # self.horizon = horizon
+        # self.n_obs_steps = n_obs_steps
 
     def get_validation_dataset(self):
         val_set = copy.copy(self)
@@ -113,7 +118,7 @@ class TactileRepresentationDataset(BaseImageDataset):
         # since the rest will be discarded anyway.
         # when self.n_obs_steps is None
         # this slice does nothing (takes all)
-        T_slice = slice(self.n_obs_steps)
+        T_slice = slice(self.n_obs_steps) # 每多少时间步一截断
 
         obs_dict = dict()
         for key in self.rgb_keys:
@@ -121,17 +126,35 @@ class TactileRepresentationDataset(BaseImageDataset):
             # T,H,W,C
             # convert uint8 image to float32
             obs_dict[key] = np.moveaxis(data[key][T_slice],-1,1
-                ).astype(np.float32) / 255.
+                ).astype(np.float32) / 255. # 归一化
             
             # T,C,H,W
             # save ram
             del data[key]
 
         del data
-        transposed_image = obs_dict['tactile_image'][0].transpose(1, 2, 0)
+
+        transposed_image = obs_dict['tactile_image'][0].transpose(1, 2, 0) # 这里只是取了第一帧图片
         H,W = self.resized_image_shape
         resized_image = cv2.resize(transposed_image, (W,H))
         tactile_image = {'image': resized_image}
+        # 改成四帧后的写法
+        # tactile_sequence = obs_dict['tactile_image']
+        # H, W = self.resized_image_shape
+        # resized_sequence = []
+        # for t in range(tactile_sequence.shape[0]):
+        #     # [C, H, W]
+        #     frame = tactile_sequence[t]
+        #     # -> [H, W, C]
+        #     frame = frame.transpose(1, 2, 0)
+        #     # -> [128, 160, 3]
+        #     frame = cv2.resize(frame, (W, H))
+        #     resized_sequence.append(frame)
+        # # [T, H, W, C]
+        # resized_sequence = np.stack(resized_sequence, axis=0).astype(np.float32)
+        # tactile_image = {
+        #     'image': resized_sequence
+        # }
 
         return tactile_image
 
