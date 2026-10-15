@@ -10,6 +10,10 @@ shape_meta: &shape_meta
       type: rgb
 with_vq: true
 use_temporal_transformer: false # 用transformer微调就是true, 不是就是false
+use_contact_weighted: true # 是否使用接触变化加权重建model/loss
+contact_lambda: 1.0
+diff_scale: 0.12
+background_frame_idx: 5056
 # baseline_ckpt: "/mnt/storage/mmm/recur_UniT/2024-08-01T15-09-47vq/checkpoints/checkpoint-epoch=342.ckpt"
 baseline_ckpt: null
 datatype: key
@@ -70,11 +74,11 @@ trainer:
   name: "vq_representiaon_dubug"
   resume: ""
   base: []
-  no_test: false
+  no_test: true
   project: null
   debug: false
   seed: 42
   postfix: ""
   train: true
 save_every: 1
-max_epochs: 344
+max_epochs: 250
