@@ -1,6 +1,8 @@
-name: train_vqvae_perception
+# 原UniT的3D姿态估计任务
+
+name: train_vqvae_perception_3Dpose_contact_weight
 _target_: UniT.workspace.train_vqvae_perception_workspace.TrainVqvaePerceptionWorkspace
-dataset_path: &dataset_path data/3D_pose_gelsight
+dataset_path: &dataset_path /mnt/storage/mmm/recur_UniT/3D_pose_gelsight
 horizon: &horizon 1
 
 task:
@@ -24,10 +26,12 @@ task:
 
 model:
   _target_: UniT.perception.vqvae_perception.VqvaePerception
+  use_temporal_transformer: False # 判断使用哪种model, TemporalVQModel还是VQModel, 使用哪种model就要使用对应的ckpt
+  use_temporal_fusion: False # 使用TemporalVQModel做任务时是否要经过transformer
   vq_model_config:
     embed_dim: 3
     n_embed: 1024
-    ckpt_path: representation_models/2024-08-01T15-09-47vq/checkpoints/checkpoint-epoch=342.ckpt
+    ckpt_path: /mnt/nvme0n1/home/mmm/projects/UniT/representation_models/2026-10-14T09-39-16contact_weighted_vq/checkpoints/checkpoint-epoch=249.ckpt
     ddconfig:
       double_z: False
       z_channels: 3
@@ -50,14 +54,14 @@ model:
   latent_shape: [3,16,20]
   freeze_encoder: True
 dataloader:
-  batch_size: 128
+  batch_size: 128 # 128
   num_workers: 8
   shuffle: true
   pin_memory: false
   persistent_workers: False
 
 val_dataloader:
-  batch_size: 128
+  batch_size: 128 # 128
   num_workers: 8
   shuffle: False
   pin_memory: false
@@ -73,7 +77,7 @@ optimizer:
 training:
   device: "cuda:0"
   seed: 42
-  resume: True
+  resume: False # 用来控制接续训练的
   lr_scheduler: cosine
   lr_warmup_steps: 500
   num_epochs: 400
@@ -87,8 +91,8 @@ training:
 
 logging:
   project: 3Dpose_benchmark
-  resume: True
-  mode: online
+  resume: False # 用来控制接续训练的
+  mode: disabled
   name: ${now:%Y.%m.%d-%H.%M.%S}_${name}
   tags: ["${name}"]
   id: null
