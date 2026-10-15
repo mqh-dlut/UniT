@@ -37,7 +37,7 @@ import wandb
 import copy
 from UniT.dataset.tactile_representation_dataset import TactileRepresentationDataset
 from UniT.dataset.tactile_representation_dataset_ycb import TactileRepresentationDatasetYcb
-from UniT.taming.models.vqgan import VQModel, WOVQModel, TemporalVQModel
+from UniT.taming.models.vqgan import VQModel, WOVQModel, TemporalVQModel, ContactWeightedVQModel
 from UniT.dataset.representation_wrapper import RepresentationWrapper
 from UniT.taming.logging_util import *
 
@@ -71,6 +71,17 @@ class TrainVqvaeRepresentationWorkspace(BaseWorkspace):
                 model = TemporalVQModel(**cfg.model)
                 name = 'temporal_vq_fromhead'
                 print('temporal_vq_fromhead')
+            elif cfg.get("use_contact_weighted", False):
+                background_zarr_path = os.path.join(cfg.dataset.dataset_path, "replay_buffer.zarr")
+                model = ContactWeightedVQModel(
+                    **cfg.model, 
+                    background_zarr_path=background_zarr_path,
+                    background_frame_idx=int(cfg.get("background_frame_idx", 5056)),
+                    contact_lambda=float(cfg.get("contact_lambda", 1.0)),
+                    diff_scale=float(cfg.get("diff_scale", 0.12))
+                )
+                name = 'contact_weighted_vq'
+                print('contact_weighted_vq model')
             else:
                 model = VQModel(**cfg.model)
                 name = 'vq'
