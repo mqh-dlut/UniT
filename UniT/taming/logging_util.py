@@ -1,3 +1,5 @@
+# 这代码是干什么的我也不知道, 但是添加了"DDP下只允许主进程保存"的功能
+
 
 import os
 import hydra
@@ -174,7 +176,10 @@ class PeriodicCheckpointCallback(Callback):
         self.verbose = verbose
         self.checkpoints = []
 
-    def on_epoch_end(self, trainer, pl_module):
+    def on_train_epoch_end(self, trainer, pl_module):
+        # DDP 下只允许主进程保存
+        if not trainer.is_global_zero:
+            return
         epoch = trainer.current_epoch
         if (epoch + 1) % self.save_interval == 0:
             filepath = os.path.join(self.ckptdir, f"checkpoint-epoch={epoch}.ckpt")
