@@ -1,3 +1,5 @@
+# 下游任务训练代码
+
 if __name__ == "__main__":
     import sys
     import os
@@ -26,6 +28,7 @@ from diffusion_policy.common.checkpoint_util import TopKCheckpointManager
 from diffusion_policy.common.json_logger import JsonLogger
 from diffusion_policy.common.pytorch_util import dict_apply, optimizer_to
 from diffusion_policy.model.common.lr_scheduler import get_scheduler
+from torch.utils.tensorboard import SummaryWriter
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
@@ -65,9 +68,9 @@ class TrainVqvaePerceptionWorkspace(BaseWorkspace):
         # configure dataset
         dataset: BaseImageDataset
         dataset = hydra.utils.instantiate(cfg.task.dataset)
+
         assert isinstance(dataset, BaseImageDataset)
         train_dataloader = DataLoader(dataset, **cfg.dataloader)
-
 
         # configure validation dataset
         val_dataset = dataset.get_validation_dataset()
@@ -113,6 +116,8 @@ class TrainVqvaePerceptionWorkspace(BaseWorkspace):
         # save batch for sampling
         train_sampling_batch = None
 
+        # 添加tensorboard
+        tb_writer = SummaryWriter(log_dir=os.path.join(self.output_dir, "tensorboard"))
 
         # training loop
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
@@ -131,11 +136,15 @@ class TrainVqvaePerceptionWorkspace(BaseWorkspace):
 
                         # compute loss
                         raw_loss, _, _ = self.model.compute_loss(batch)
-                        loss = raw_loss / cfg.training.gradient_accumulate_every
-                        loss.backward()
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, norm_type=2)
-                        # step optimizer
-                        if self.global_step % cfg.training.gradient_accumulate_every == 0:
+                        accum_steps = cfg.training.gradient_accumulate_every
+                        loss = raw_loss / accum_steps 
+                        loss.backward() # 会对梯度进行累积, 不更新
+
+                        # step optimizer 这里解决的是因为梯度累积导致应该何时更新的问题，但是还是有缺点
+                        is_last_batch = (batch_idx == len(train_dataloader) - 1)
+                        should_step = (((batch_idx + 1) % accum_steps == 0) or is_last_batch)
+                        if should_step:
+                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, norm_type=2) # 梯度裁剪, 防止梯度爆炸
                             self.optimizer.step()
                             self.optimizer.zero_grad()
                             lr_scheduler.step()
@@ -150,6 +159,9 @@ class TrainVqvaePerceptionWorkspace(BaseWorkspace):
                             'epoch': self.epoch,
                             'lr': lr_scheduler.get_last_lr()[0]
                         }
+                        # 通过tensorboard记录数据
+                        tb_writer.add_scalar("train/loss_step", raw_loss_cpu, self.global_step)
+                        tb_writer.add_scalar("train/lr", lr_scheduler.get_last_lr()[0], self.global_step)
 
                         is_last_batch = (batch_idx == (len(train_dataloader)-1))
                         if not is_last_batch:
@@ -166,6 +178,8 @@ class TrainVqvaePerceptionWorkspace(BaseWorkspace):
                 # replace train_loss with epoch average
                 train_loss = np.mean(train_losses)
                 step_log['train_loss'] = train_loss
+                # 通过tensorboard记录数据
+                tb_writer.add_scalar("train/loss_epoch", train_loss, self.epoch)
 
                 # run validation
                 if (self.epoch % cfg.training.val_every) == 0:
@@ -193,12 +207,18 @@ class TrainVqvaePerceptionWorkspace(BaseWorkspace):
                                 if cfg.model.task_type == "classification":
                                     step_log['val_loss'] = val_loss
                                     step_log['accuracy'] = val_linear_loss
+                                    tb_writer.add_scalar("val/loss", val_loss, self.epoch)
+                                    tb_writer.add_scalar("val/accuracy", val_linear_loss, self.epoch)
                                 elif cfg.model.task_type == "6Dpose":
                                     step_log['val_loss'] = val_loss
                                     step_log['val_linear_loss'] = val_linear_loss
                                     step_log['val_rotation_loss'] = val_rotation_loss
+                                    tb_writer.add_scalar("val/loss", val_loss, self.epoch)
+                                    tb_writer.add_scalar("val/linear_loss", val_linear_loss, self.epoch)
+                                    tb_writer.add_scalar("val/rotation_loss", val_rotation_loss, self.epoch)
                             else:
                                 step_log['val_loss'] = val_loss
+                                tb_writer.add_scalar("val/loss", val_loss, self.epoch)
 
                 # checkpoint
                 if (self.epoch % cfg.training.checkpoint_every) == 0:
@@ -228,6 +248,8 @@ class TrainVqvaePerceptionWorkspace(BaseWorkspace):
                 json_logger.log(step_log)
                 self.global_step += 1
                 self.epoch += 1
+
+        tb_writer.close()
 
 @hydra.main(
     version_base=None,
