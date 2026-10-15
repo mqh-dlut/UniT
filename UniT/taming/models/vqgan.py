@@ -1,4 +1,6 @@
 # 原始模型VQModel以及重写了添加了Transformer模块的VQModel
+# 新增背景差分模型BackgroundDiffVQModel, 预测预测图与背景图之间的差分, 包括损失、优化器等
+# 新增ContactWeightedVQModel模型, 只是多在原基础上多添加了一个接触加权损失
 
 import torch
 import torch.nn.functional as F
@@ -9,6 +11,11 @@ from UniT.taming.modules.diffusionmodules.model import Encoder, Decoder
 from UniT.taming.modules.vqvae.quantize import VectorQuantizer2 as VectorQuantizer
 from UniT.taming.modules.vqvae.quantize import GumbelQuantize
 from UniT.taming.modules.vqvae.quantize import EMAVectorQuantizer
+
+import torch.nn as nn
+import zarr
+import cv2
+import numpy as np
 
 class VQModel(pl.LightningModule):
     def __init__(self,
@@ -824,3 +831,267 @@ class WOVQModel(pl.LightningModule):
         x = F.conv2d(x, weight=self.colorize)
         x = 2.*(x-x.min())/(x.max()-x.min()) - 1.
         return x
+
+class BackgroundDiffVQModel(VQModel):
+    """
+    在原始 VQModel 上增加背景差分辅助分支。
+    原始主干：
+        image -> Encoder -> quant_conv -> VQ -> Decoder
+    新增分支：
+        quant_conv 输出 z -> diff_head -> 预测背景差分图
+    """
+
+    def __init__(self, background_zarr_path, background_frame_idx=5056, diff_weight=0.1, **kwargs):
+        # 1. 创建原始 UniT 模型
+        super().__init__(**kwargs)
+
+        self.diff_weight = float(diff_weight)
+        # 2. 新增背景差分预测分支, 输入是下游使用的连续特征 z
+        self.diff_head = nn.Sequential(
+            nn.Conv2d(kwargs["embed_dim"], 32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 16, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 1, kernel_size=1),
+            nn.Sigmoid()
+        )
+
+        # 3. 读取参考背景图片
+        root = zarr.open(background_zarr_path, mode="r")
+        background = np.asarray(
+            root["data"]["tactile_image"][
+                background_frame_idx
+            ]
+        ).astype(np.float32)
+
+        # 4. 与 Dataset 使用相同的预处理
+        background = background / 255.0
+        background = cv2.resize(
+            background,
+            (160, 128),
+            interpolation=cv2.INTER_LINEAR
+        )
+
+        # [H,W,3] -> [1,3,H,W]
+        background = torch.from_numpy(
+            np.ascontiguousarray(background)
+        ).permute(2, 0, 1).unsqueeze(0)
+
+        # 注册为 buffer：不参与梯度更新，但会随模型移动到 GPU
+        self.register_buffer("background", background)
+
+        print("Background loaded:", background_zarr_path, "frame:", background_frame_idx)
+
+    def make_diff_target(self, x):
+        """
+        x: [B,3,128,160]
+        返回真实背景差分图: [B,1,128,160]
+        """
+        if x.shape[1:] != self.background.shape[1:]:
+            raise ValueError(
+                f"Input shape {x.shape[1:]} "
+                f"does not match background "
+                f"{self.background.shape[1:]}"
+            )
+
+        # 每个像素 RGB 三通道的平均绝对差
+        diff = torch.abs(x - self.background).mean(dim=1, keepdim=True)
+
+        return diff
+
+    def forward_with_aux(self, x):
+        """
+        同时执行原图重建和背景差分预测。
+        """
+
+        # 1. Encoder 提取特征
+        h = self.encoder(x)
+
+        # 2. 得到下游所用的连续特征
+        z = self.quant_conv(h)
+
+        # 3. 新增分支预测差分图
+        pred_diff = self.diff_head(z)
+        # 从特征分辨率放大至原图尺寸
+        pred_diff = F.interpolate(
+            pred_diff,
+            size=x.shape[-2:],
+            mode="bilinear",
+            align_corners=False
+        )
+
+        # 4. 原始 VQ 重建流程
+        quant, qloss, _ = self.quantize(z)
+
+        xrec = self.decode(quant)
+
+        return xrec, qloss, pred_diff
+
+    
+    def training_step(self, batch, batch_idx, optimizer_idx):
+
+        # 判别器：完全沿用原始 UniT
+        if optimizer_idx == 1:
+            return super().training_step(batch, batch_idx, optimizer_idx)
+
+        # 自编码器：增加背景差分辅助监督
+        if optimizer_idx == 0:
+
+            x = self.get_input(batch, self.image_key)
+            # 1. 同时获得重建图和预测差分图
+            xrec, qloss, pred_diff = (self.forward_with_aux(x))
+
+            # 2. 计算原始 UniT 损失
+            aeloss, log_dict_ae = self.loss(qloss, x, xrec, optimizer_idx, self.global_step,
+                                            last_layer=self.get_last_layer(), split="train")
+
+            # 3. 生成真实背景差分图
+            with torch.no_grad():
+                true_diff = self.make_diff_target(x)
+
+            # 4. 计算差分辅助损失
+            diff_loss = F.l1_loss(pred_diff, true_diff)
+
+            # 5. 计算总损失
+            total_loss = (aeloss + self.diff_weight * diff_loss)
+
+            # 6. 记录训练日志
+            self.log("train/aeloss", aeloss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+            self.log("train/diff_loss", diff_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+            self.log("train/total_ae_loss", total_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+            self.log("train/diff_target_mean", true_diff.mean(), on_step=True, on_epoch=True, sync_dist=True)
+            self.log("train/diff_pred_mean", pred_diff.mean(), on_step=True, on_epoch=True, sync_dist=True)
+            self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=True, sync_dist=True)
+
+            return total_loss
+
+        raise ValueError(
+            f"Unexpected optimizer_idx={optimizer_idx}"
+        )
+
+    def configure_optimizers(self):
+        # 继承原始 UniT 的两个优化器
+        optimizers, schedulers = super().configure_optimizers()
+
+        # 第一个优化器负责自编码器
+        opt_ae = optimizers[0]
+
+        # 把新增分支加入自编码器优化器
+        opt_ae.add_param_group({
+            "params": list(self.diff_head.parameters())
+        })
+
+        return optimizers, schedulers
+
+
+class ContactWeightedVQModel(VQModel):
+    """
+    UniT + 接触变化加权重建
+
+    保留原始 VQModel 全部主干结构。
+    不增加任何预测分支。
+    只在自编码器损失中增加接触变化加权项。
+    """
+
+    def __init__(self, background_zarr_path, background_frame_idx=5056, contact_lambda=1.0, diff_scale=0.12, **kwargs):
+        super().__init__(**kwargs)
+
+        self.contact_lambda = float(contact_lambda)
+        self.diff_scale = float(diff_scale)
+
+        if self.diff_scale <= 0:
+            raise ValueError("diff_scale must be positive")
+
+        # 读取参考背景
+        root = zarr.open(background_zarr_path, mode="r")
+
+        background = np.asarray(
+            root["data"]["tactile_image"][
+                background_frame_idx
+            ]
+        ).astype(np.float32) / 255.0
+
+        # 与 Dataset 使用相同的预处理
+        background = cv2.resize(
+            background,
+            (160, 128),
+            interpolation=cv2.INTER_LINEAR
+        )
+
+        background = torch.from_numpy(
+            np.ascontiguousarray(background)
+        ).permute(2, 0, 1).unsqueeze(0)
+
+        # 背景不参与训练，也不保存到 checkpoint
+        self.register_buffer("background", background, persistent=False)
+
+    @torch.no_grad()
+    def make_contact_weight(self, x):
+        """
+        x: [B,3,128,160]
+
+        return:
+            weight: [B,1,128,160]
+            diff:   [B,1,128,160]
+        """
+        if x.shape[1:] != self.background.shape[1:]:
+            raise ValueError(
+                "Input and background shape mismatch"
+            )
+
+        # 计算 RGB 平均绝对背景差异
+        diff = torch.abs(x - self.background).mean(dim=1, keepdim=True)
+
+        # 连续权重，限制到 0~1
+        weight = torch.clamp(diff / self.diff_scale, min=0.0, max=1.0)
+
+        return weight, diff
+
+    def compute_contact_loss(self, x, xrec):
+        """
+        接触变化加权重建损失。
+        """
+        weight, diff = self.make_contact_weight(x)
+
+        # 每个像素的平均 RGB 重建误差
+        pixel_error = torch.abs(xrec - x).mean(dim=1, keepdim=True)
+
+        # 变化明显区域贡献更大的额外损失
+        contact_loss = (weight * pixel_error).mean()
+
+        return contact_loss, weight, diff
+
+    def training_step(self, batch, batch_idx, optimizer_idx):
+
+        # 判别器：保持原始 UniT 训练逻辑
+        if optimizer_idx == 1:
+            return super().training_step(
+                batch, batch_idx, optimizer_idx
+            )
+
+        if optimizer_idx == 0:
+
+            x = self.get_input(batch, self.image_key)
+
+            # 原始 UniT 前向传播
+            xrec, qloss = self(x)
+
+            # 原始 VQGAN 损失
+            aeloss, log_dict_ae = self.loss(qloss, x, xrec, optimizer_idx, self.global_step, last_layer=self.get_last_layer(), split="train")
+            # 新增：接触变化加权重建损失
+            contact_loss, weight, diff = (self.compute_contact_loss(x, xrec))
+            total_loss = (aeloss + self.contact_lambda * contact_loss)
+
+            # 日志记录
+            self.log("train/aeloss", aeloss, on_step=True, on_epoch=True, sync_dist=True)
+            self.log("train/contact_loss", contact_loss, on_step=True, on_epoch=True, sync_dist=True)
+            self.log("train/total_ae_loss", total_loss, on_step=True, on_epoch=True, sync_dist=True)
+            self.log("train/contact_weight_mean", weight.mean(), on_step=True, on_epoch=True, sync_dist=True)
+            self.log("train/background_diff_mean", diff.mean(), on_step=True, on_epoch=True, sync_dist=True)
+            self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=True, sync_dist=True)
+
+            return total_loss
+
+        raise ValueError(
+            f"Unexpected optimizer_idx={optimizer_idx}"
+        )
