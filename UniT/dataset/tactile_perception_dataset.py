@@ -1,3 +1,6 @@
+# 3D、6D数据集处理
+#! 注意horizon、no_obs_steps的切换、一帧和四帧写法的切换
+
 from typing import Dict
 import torch
 import numpy as np
@@ -21,7 +24,7 @@ class TactilePerceptionDataset(BaseImageDataset):
     def __init__(self,
             shape_meta: dict,
             dataset_path: str,
-            horizon=1,
+            horizon=4, # 1,
             pad_before=0,
             pad_after=0,
             n_obs_steps=None,
@@ -87,8 +90,10 @@ class TactilePerceptionDataset(BaseImageDataset):
         self.pad_after = pad_after
         self.resized_image_shape = resized_image_shape
         # Dummy value
-        self.horizon = 1
-        self.n_obs_steps = 1
+        # self.horizon = horizon # 1
+        # self.n_obs_steps = n_obs_steps # 1
+        self.horizon = 1 
+        self.n_obs_steps = 1 
         self.data_type = data_type
     def get_validation_dataset(self):
         val_set = copy.copy(self)
@@ -123,17 +128,39 @@ class TactilePerceptionDataset(BaseImageDataset):
             obs_dict['image'] = resized_image
             # save ram
             del data['tactile_left_image']
-        elif self.data_type == '3Dpose':
 
+        elif self.data_type == '3Dpose':
             tactile_image = (data['tactile_image'][T_slice].astype(np.float32) / 255.)[0]
             H,W = self.resized_image_shape
             resized_image = cv2.resize(tactile_image, (W,H))
             obs_dict['image'] = resized_image
+
+            # 改成四帧后的写法
+            # tactile_sequence = (data['tactile_image'][T_slice].astype(np.float32) / 255.) # [T, H, W, C]
+            # H, W = self.resized_image_shape
+            # resized_sequence = []
+            # for t in range(tactile_sequence.shape[0]):
+            #     # [H, W, C]
+            #     frame = tactile_sequence[t]
+            #     # -> [128, 160, 3]
+            #     frame = cv2.resize(frame, (W, H))
+            #     resized_sequence.append(frame)
+            # # [T, H, W, C]
+            # resized_sequence = np.stack(resized_sequence, axis=0).astype(np.float32)
+
+            # if self.horizon == 1:
+            #     obs_dict['image'] = resized_sequence[0] # baseline
+            # else:
+            #     obs_dict['image'] = resized_sequence
+
             # save ram
             del data['tactile_image']
 
         for key in self.lowdim_keys:
-            obs_dict[key] = data[key][T_slice][0].astype(np.float32)
+            if self.horizon == 1: 
+                obs_dict[key] = data[key][T_slice][0].astype(np.float32)
+            else:
+                obs_dict[key] = data[key][T_slice][-1].astype(np.float32) # pose标签取最后一帧
             # save ram
             del data[key]
         
