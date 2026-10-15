@@ -1,10 +1,14 @@
+# 进行下游任务的模型
+#! 注意模型的选取
+
 from typing import Dict
 import torch
 import torch.nn as nn
-from UniT.taming.models.vqgan import VQModel
+from UniT.taming.models.vqgan import VQModel, TemporalVQModel
 from UniT.model.tactile.utils import quaternion_angle_loss
 from UniT.model.tactile.utils import ConvPoolingHead
 from UniT.model.tactile.utils import MlpHead
+import copy
 
 class VqvaePerception(nn.Module):
     def __init__(self, 
@@ -12,11 +16,24 @@ class VqvaePerception(nn.Module):
             latent_shape=[3,28,28],
             freeze_encoder=True,
             task_type='3Dpose',
-            num_classes=None
+            num_classes=None,
+            use_temporal_transformer=False,
+            use_temporal_fusion=False
         ):
         super().__init__()
-        self.vqgan = VQModel(**vq_model_config)
+        # self.vqgan = VQModel(**vq_model_config)
+        vq_cfg = copy.deepcopy(vq_model_config)
+        ckpt_path = vq_cfg.pop("ckpt_path", None)
+        if use_temporal_transformer:
+            self.vqgan = TemporalVQModel(**vq_cfg)
+        else:
+            self.vqgan = VQModel(**vq_cfg)
+        if ckpt_path is not None:
+            self.vqgan.init_from_ckpt(ckpt_path)
+
         self.task_type = task_type
+        self.use_temporal_transformer=use_temporal_transformer # 还是通过yaml传递
+        self.use_temporal_fusion=use_temporal_fusion
 
         if freeze_encoder:
             for param in self.vqgan.parameters():
@@ -40,6 +57,10 @@ class VqvaePerception(nn.Module):
 
     def forward(self, image):
         # batch: B H W C
+        if (self.use_temporal_transformer and not self.use_temporal_fusion and image.ndim == 5):
+            # 消融实验：仍然使用同一个 T=4 数据集，
+            # 但 representation 只看最后一帧
+            image = image[:, -1]
         tactile_feature = self.vqgan.to_latent(self.vqgan.get_input({'image': image}, 'image'))
         tactile_feature = self.conv_pooling_head(tactile_feature)
         output = self.mlp_head(tactile_feature)
